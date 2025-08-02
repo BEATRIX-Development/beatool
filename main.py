@@ -1,5 +1,10 @@
+import pyfiglet
+
+TITLE_FONT = pyfiglet.Figlet(font="slant")
+
+
 def main():
-    print("Hello from beatool!")
+    print(TITLE_FONT.renderText("BeaTool"))
 
 
 if __name__ == "__main__":
