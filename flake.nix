@@ -19,8 +19,9 @@
         targetPkgs =
           pkgs:
           (with pkgs; [
-            zsh
             uv
+            libudev-zero
+            libusb1.out
           ]);
       };
     in
