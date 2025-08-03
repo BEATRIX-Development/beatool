@@ -9,6 +9,9 @@ import usb.util
 import usb
 import usb.control
 import math
+import os
+import urllib3
+import yaspin
 
 TITLE_FONT = pyfiglet.Figlet(font="slant")
 SCREEN_WIDTH = 80
@@ -23,15 +26,27 @@ BANNER_COLORS = [
     colorama.Fore.LIGHTBLUE_EX,
     colorama.Fore.BLUE,
 ]
+# In form "Release Name": "https://release.url/file.bin"
+KNOWN_RELEASES: dict[str, str] = {}
+HTTP = urllib3.PoolManager(timeout=10)
 
 
 def print_banner():
+    """
+    Prints the BeaTool banner.
+    """
     for color, line in zip(BANNER_COLORS, BANNER.splitlines()):
         print(colorama.Style.BRIGHT + color + line)
     print(colorama.Style.RESET_ALL)
 
 
 def output_text(text: str, /, bold: bool = True):
+    """
+    Prints out text after wrapping it and styling it as necessary
+
+    Takes: the text as a string, and optionally a boolean indicating if text should be
+    bolded
+    """
     if bold:
         print(colorama.Style.BRIGHT, end="")
     print("\n".join(textwrap.wrap(text, replace_whitespace=False, width=SCREEN_WIDTH)))
@@ -39,6 +54,12 @@ def output_text(text: str, /, bold: bool = True):
 
 
 def scan_devices() -> tuple[list[usb.core.Device], dict[str, str]]:
+    """
+    Manages the UI for scanning for devices.
+
+    Returns: a tuple with a list of devices and a dictionary of available options,
+    with option letters being mapped to option titles
+    """
     dev_list = dfu.find_dfu_devices()
     device_str = f"Found {len(dev_list)} device{'s' if len(dev_list) != 1 else ''}."
     options = {
@@ -52,16 +73,103 @@ def scan_devices() -> tuple[list[usb.core.Device], dict[str, str]]:
     else:
         options |= {
             "F": "Flash all devices",
-            "C": "Choose a single device to flash",
         }
     output_text(device_str)
     return (dev_list, options)
 
 
-def download_file(filename: str, dev: usb.Device):
-    with open(filename, "rb") as f:
-        data = f.read()
+def download_file(url: str) -> bytes:
+    """
+    Downloads a file from the Internet with helpful messages and a couple spinners.
+
+    Takes: a string indicating the URL to download from
+    Returns: the data in `bytes` form
+    """
+    try:
+        with yaspin.yaspin():
+            r = HTTP.request(
+                "GET",
+                KNOWN_RELEASES[opts[choice]],
+                preload_content=False,
+            )
+    except Exception as e:
+        output_text(colorama.Fore.RED + "Failed to open HTTP connection.")
+        raise e
+    if r.status != 200:
+        output_text(
+            colorama.Fore.RED + f"Failed to fetch remote file (HTTP status {r.status})."
+        )
+        exit(-1)
+    output_text("Connection created.")
+    result = b""
+    with yaspin.yaspin():
+        while True:
+            data = r.read(1024)
+            if not data:
+                break
+            result += data
+    r.release_conn()
+    output_text("File downloaded.")
+    return result
+
+
+def pick_file_or_release() -> bytes:
+    """
+    Manages the GUI for picking a file or a known release.
+
+    Returns: the data from the user's choice
+    """
+    if len(KNOWN_RELEASES) > 0:
+        text = "Would you like to flash an existing file or download a known release?"
+        text += " Known releases include "
+        if len(KNOWN_RELEASES) == 1:
+            text += list(KNOWN_RELEASES.keys())[0]
+        elif len(KNOWN_RELEASES) == 2:
+            text += " and ".join(KNOWN_RELEASES.keys())
+        else:
+            releases = list(KNOWN_RELEASES.keys())
+            text += ", ".join(releases[:-1])
+            text += f", and {releases[-1]}"
+        text += "."
+        output_text(text)
+
+        opts = {
+            str(i): s for i, s in enumerate(["Choose a file", *KNOWN_RELEASES.keys()])
+        }
+        choice_str = "\n".join([f"({i}) {s}" for i, s in opts.items()])
+        output_text(choice_str)
+        choice = input(colorama.Style.BRIGHT + "> " + colorama.Style.RESET_ALL)
+        while choice not in opts.keys():
+            output_text(colorama.Fore.RED + "Invalid choice. Please choose again.")
+            choice = input(colorama.Style.BRIGHT + "> " + colorama.Style.RESET_ALL)
+        print()
+
+        if choice != "0":
+            return download_file(KNOWN_RELEASES[opts[choice]])
+
+    output_text("Enter the absolute path of the .bin file.")
+    choice = input(colorama.Style.BRIGHT + "> " + colorama.Style.RESET_ALL)
+    while not os.path.exists(choice):
+        output_text(
+            colorama.Fore.RED
+            + "Invalid choice (file does not exist). Please choose again."
+        )
+        choice = input(colorama.Style.BRIGHT + "> " + colorama.Style.RESET_ALL)
+    print()
+
+    with open(choice, "rb") as f, yaspin.yaspin():
+        result = f.read()
+    return result
+
+
+def download_bin(data: bytes, dev: usb.Device):
+    """
+    Manages the GUI for flashing binary data onto the device.
+
+    Takes: the data in bytes, and the device as a usb.Device
+    """
     n_blocks = math.ceil(len(data) / dfu.get_transfer_size(dev))
+    output_text(f"Downloading a total of {n_blocks} blocks (usually KiB).")
     dev.ctrl_transfer(
         bmRequestType=0b00100001,
         bRequest=1,
@@ -74,8 +182,9 @@ def download_file(filename: str, dev: usb.Device):
         try:
             is_working = dfu.get_status(dev)[4] not in [2, 5]
         except Exception as e:
-            print(e)
-    for i in tqdm.tqdm(range(n_blocks), ncols=SCREEN_WIDTH):
+            output_text(colorama.Fore.RED + "Reading USB status failed.")
+            raise e
+    for i in tqdm.tqdm(range(n_blocks), ncols=SCREEN_WIDTH, unit="bl"):
         dfu.download(dev, i + 2, data[i * 1024 : (i + 1) * 1024])
     dfu.download(dev, 0, b"", should_ignore=True)
     try:
@@ -114,14 +223,16 @@ def main():
                 output_text("Quitting BeaTool.")
                 exit(0)
             case "F":
+                data = pick_file_or_release()
                 for dev in devices:
                     output_text(
-                        f"Now flashing device with serial number {usb.util.get_string(dev, dev.iSerialNumber)}"
+                        f"Now flashing device with serial number {usb.util.get_string(dev, dev.iSerialNumber)}."
                     )
-                    download_file(
-                        "/home/juniper/Documents/beatrix/bin/release.bin", dev
-                    )
+                    download_bin(data, dev)
+                    print()
+                    output_text("Device flashed.")
         break
+    output_text("Now exiting. Have a nice day!")
 
 
 if __name__ == "__main__":
